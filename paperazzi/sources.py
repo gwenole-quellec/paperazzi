@@ -8,32 +8,146 @@ All network requests are triggered explicitly by the user interface.
 from __future__ import annotations
 
 import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import requests
+from bibtexparser.bparser import BibTexParser
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from .core import normalize_doi, normalize_openalex, normalize_title
+from .core import (
+    extract_bibliographic_details,
+    normalize_doi,
+    normalize_openalex,
+    normalize_title,
+)
 
-TIMEOUT_SECONDS = 25
+# A connection can fail before a response is returned; a slow OpenAlex query
+# may also need more than the default read timeout.
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 45
+REQUEST_TIMEOUT = (CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS)
+
+# Four retries after the initial request, with exponential backoff. All calls
+# are GET requests, so retrying them is safe. Respect Retry-After when present.
+RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
+RETRY_POLICY = Retry(
+    total=4,
+    connect=4,
+    read=4,
+    status=4,
+    backoff_factor=1.0,
+    status_forcelist=RETRYABLE_STATUS_CODES,
+    allowed_methods=frozenset({"GET"}),
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Paperazzi/0.3 (local research-team bibliography)",
+    "User-Agent": "Paperazzi/0.2 (local research-team bibliography)",
     "Accept": "application/json",
 })
+SESSION.mount("https://", HTTPAdapter(max_retries=RETRY_POLICY))
 
 
-def api_json(url: str, params: dict | None = None, headers: dict | None = None) -> dict:
-    """GET a JSON API response, reporting throttling as a readable error."""
-    response = SESSION.get(
-        url, params=params, headers=headers, timeout=TIMEOUT_SECONDS
-    )
-    if response.status_code == 429:
-        raise RuntimeError(f"API rate limit reached at {response.url}. Try again later.")
-    response.raise_for_status()
-    return response.json()
+def _endpoint_without_query(url: str) -> str:
+    """Return a useful endpoint name without query parameters or credentials."""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _extract_key_from_url(url: str) -> tuple[str, str]:
+    """Strip an OpenAlex API key from a legacy URL before it reaches requests.
+
+    Most Paperazzi calls provide the key through ``openalex_params``. This
+    additionally protects accidental direct calls with ``?api_key=...``.
+    """
+    parts = urlsplit(url)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    api_key = next((value for key, value in query if key.lower() == "api_key"), "")
+    filtered_query = [
+        (key, value) for key, value in query if key.lower() != "api_key"
+    ]
+    cleaned = urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(filtered_query),
+        parts.fragment,
+    ))
+    return cleaned, api_key
+
+
+def api_json(
+    url: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+) -> dict:
+    """Fetch an API JSON document with retries and secret-safe errors.
+
+    OpenAlex authentication is sent through ``Authorization: Bearer`` rather
+    than ``api_key`` in the query string. The public function signature stays
+    unchanged so existing OpenAlex, Crossref, and test callers still work.
+
+    Transient HTTP failures (429 and 5xx) and connection/read failures are
+    automatically retried by the session adapter. Errors never include the
+    request query string or the value of the API key.
+    """
+    safe_url, url_key = _extract_key_from_url(url)
+    safe_params = dict(params or {})
+    param_key = safe_params.pop("api_key", "")
+    api_key = str(param_key or url_key).strip()
+
+    request_headers = dict(headers or {})
+    endpoint = _endpoint_without_query(safe_url)
+    is_openalex = urlsplit(safe_url).hostname == "api.openalex.org"
+
+    if api_key:
+        if not is_openalex:
+            raise ValueError("OpenAlex API credentials cannot be sent to another host.")
+        request_headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        response = SESSION.get(
+            safe_url,
+            params=safe_params,
+            headers=request_headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.exceptions.RequestException as exc:
+        # requests' exception strings may include a URL; never forward them.
+        raise RuntimeError(
+            f"Request to {endpoint} failed after retries "
+            f"({type(exc).__name__}). Try again later."
+        ) from None
+
+    status = response.status_code
+    if status >= 400:
+        if status == 401 and is_openalex:
+            detail = "Check that your OpenAlex API key is valid."
+        elif status == 429:
+            detail = "Rate limit or API budget reached; retry later."
+        elif status in RETRYABLE_STATUS_CODES:
+            detail = "Temporary server error; retries exhausted."
+        else:
+            detail = "Check the request or access permissions."
+        raise RuntimeError(f"HTTP {status} from {endpoint}. {detail}") from None
+
+    try:
+        return response.json()
+    except (ValueError, requests.exceptions.RequestException):
+        raise RuntimeError(
+            f"Invalid JSON response from {endpoint}."
+        ) from None
 
 
 def openalex_params(api_key: str = "", email: str = "") -> dict:
-    """Include the OpenAlex API key and optional polite-pool email if provided."""
+    """Build OpenAlex options; ``api_json`` moves the key into an HTTP header.
+
+    Keep the historical parameter format for compatibility with the existing
+    import functions and their tests. The API key is not sent in the URL.
+    """
     params = {}
     if api_key:
         params["api_key"] = api_key.strip()
@@ -82,7 +196,19 @@ def from_openalex(item: dict) -> dict:
         "citations": item.get("cited_by_count"),
         "openalex_id": item.get("id"),
         "raw": item,
+        **extract_bibliographic_details("openalex", item),
     }
+
+
+def openalex_author_profile(author_id: str, api_key: str = "", email: str = "") -> dict:
+    """Retrieve an author's canonical name and OpenAlex alternative bylines."""
+    match = re.search(r"A\d+", author_id, re.IGNORECASE)
+    if not match:
+        raise ValueError("Invalid OpenAlex Author ID")
+    return api_json(
+        "https://api.openalex.org/authors/" + match.group(0).upper(),
+        openalex_params(api_key, email),
+    )
 
 
 def openalex_works(
@@ -163,6 +289,7 @@ def from_crossref(item: dict) -> dict:
         "work_type": item.get("type"),
         "citations": item.get("is-referenced-by-count"),
         "raw": item,
+        **extract_bibliographic_details("crossref", item),
     }
 
 
@@ -187,10 +314,6 @@ def crossref_author_search(
     params = {
         "query.author": full_name,
         "rows": min(rows, 1000),
-        "select": (
-            "DOI,title,author,container-title,published,issued,created,"
-            "type,is-referenced-by-count"
-        ),
     }
     if email:
         params["mailto"] = email
@@ -228,7 +351,8 @@ def parse_bibtex(
         content.decode("utf-8-sig", errors="replace")
         if isinstance(content, bytes) else content
     )
-    bibliography = bibtexparser.loads(raw_text)
+    parser = BibTexParser(ignore_nonstandard_types=False)
+    bibliography = bibtexparser.loads(raw_text, parser=parser)
     records = []
     for entry in bibliography.entries:
         if not entry.get("title"):
@@ -252,6 +376,7 @@ def parse_bibtex(
             "work_type": entry.get("ENTRYTYPE"),
             "citations": None,
             "raw": entry,
+            **extract_bibliographic_details(source, entry),
         })
     return records
 

@@ -40,6 +40,9 @@ from paperazzi.team import (
     add_member,
     add_records,
     connect_team,
+    cached_alias_index,
+    missing_author_profiles,
+    save_author_profile,
     delete_member,
     get_team_works,
     list_members,
@@ -63,9 +66,10 @@ CATEGORIES = {
     "Articles": lambda work: work["bibtex_type"] == "article",
     "Proceedings": lambda work: work["bibtex_type"] in {"inproceedings", "conference"},
     "Book Chapters": lambda work: work["bibtex_type"] == "incollection",
+    "Datasets / Databases": lambda work: work["bibtex_type"] == "dataset",
     "Patents": lambda work: work["bibtex_type"] == "patent",
     "Other": lambda work: work["bibtex_type"]
-    not in {"article", "inproceedings", "conference", "incollection", "patent"},
+    not in {"article", "inproceedings", "conference", "incollection", "dataset", "patent"},
 }
 
 STYLE = """
@@ -189,7 +193,10 @@ def members_table(members: list[dict]) -> pd.DataFrame:
         }
         for person in members
     ]
-    return pd.DataFrame(records, columns=columns)
+    table = pd.DataFrame(records, columns=columns)
+    for column in ("Start year", "End year"):
+        table[column] = pd.to_numeric(table[column], errors="coerce").astype("Int64")
+    return table
 
 
 def render_sidebar(members: list[dict], member_labels: dict[int, str]) -> dict:
@@ -247,8 +254,10 @@ def render_sidebar(members: list[dict], member_labels: dict[int, str]) -> dict:
     }
 
 
-def render_team_tab(connection, members: list[dict], labels: dict[int, str]) -> None:
-    """Manage individual OpenAlex author identifiers and inclusive year bounds."""
+def render_team_tab(
+    connection, members: list[dict], labels: dict[int, str], options: dict
+) -> None:
+    """Manage researchers, identify candidate profiles, and cache author aliases."""
     st.subheader("Team members")
     st.write(
         "Each researcher may have **multiple OpenAlex Author IDs**. "
@@ -283,39 +292,110 @@ def render_team_tab(connection, members: list[dict], labels: dict[int, str]) -> 
 
     with left:
         st.markdown("#### Add a member")
-        with st.form("add_member_form"):
-            first_name = st.text_input("First name")
-            last_name = st.text_input("Last name")
-            author_ids = st.text_input(
-                "OpenAlex Author ID(s)", placeholder="A5028479581, A1234567890"
-            )
-            st.caption("Inclusive publication years; leave blank for no limit.")
-            start_year = st.number_input(
-                "Start year (optional)",
-                min_value=1000,
-                max_value=2200,
-                value=None,
-                step=1,
-                placeholder="No limit",
-                key="add_start",
-            )
-            end_year = st.number_input(
-                "End year (optional)",
-                min_value=1000,
-                max_value=2200,
-                value=None,
-                step=1,
-                placeholder="No limit",
-                key="add_end",
-            )
-            submitted = st.form_submit_button("Add researcher", type="primary")
+        st.caption(
+            "Enter the researcher's name, find their OpenAlex profiles, "
+            "then select at least one verified profile to add them. "
+            "Publication-year limits can be set afterwards in Edit a member."
+        )
 
-        if submitted:
+        # Keep the name fields outside a form so a changed name immediately
+        # invalidates earlier search results and disables profile selection.
+        if st.session_state.pop("reset_add_member", False):
+            st.session_state["new_member_first_name"] = ""
+            st.session_state["new_member_last_name"] = ""
+            st.session_state["member_candidate_ids"] = []
+
+        first_name = st.text_input("First name", key="new_member_first_name")
+        last_name = st.text_input("Last name", key="new_member_last_name")
+        current_query = f"{first_name.strip()} {last_name.strip()}".strip()
+        has_name = bool(first_name.strip() and last_name.strip())
+
+        if st.button("Find OpenAlex candidates", disabled=not has_name):
+            # Clear stale matches before searching, including after an API error.
+            st.session_state["member_candidate_results"] = []
+            st.session_state["member_candidate_query"] = current_query
+            st.session_state["member_candidate_ids"] = []
             try:
-                add_member(connection, first_name, last_name, author_ids, start_year, end_year)
-                report_and_reload("Researcher added.")
+                st.session_state["member_candidate_results"] = sources.openalex_authors(
+                    current_query, options["api_key"]
+                )
             except Exception as error:
-                st.error(str(error))
+                st.error(f"OpenAlex author search: {error}")
+
+        candidate_results = (
+            st.session_state.get("member_candidate_results", [])
+            if st.session_state.get("member_candidate_query") == current_query
+            else []
+        )
+        if candidate_results:
+            st.caption(
+                "Choose one or more matching profiles. Check names, "
+                "affiliations and publication counts to avoid namesakes."
+            )
+            candidate_info = {}
+            for candidate in candidate_results:
+                author_id = str(candidate.get("id") or "").split("/")[-1]
+                if not author_id:
+                    continue
+                institutions = candidate.get("last_known_institutions") or []
+                affiliations = ", ".join(
+                    institution.get("display_name", "")
+                    for institution in institutions[:2]
+                )
+                candidate_info[author_id] = (
+                    f"{candidate.get('display_name', '?')} · {author_id} · "
+                    f"{candidate.get('works_count', '?')} works · "
+                    f"{affiliations or 'No affiliation'}"
+                )
+
+            chosen = st.multiselect(
+                "Select OpenAlex profile(s)",
+                options=list(candidate_info),
+                format_func=lambda identifier: candidate_info[identifier],
+                key="member_candidate_ids",
+            )
+            if st.button(
+                "Add researcher",
+                type="primary",
+                disabled=not chosen,
+                help="Select at least one OpenAlex profile first.",
+            ):
+                try:
+                    # Only allow identifiers offered in this search result.
+                    verified_ids = [identifier for identifier in chosen
+                                    if identifier in candidate_info]
+                    if not verified_ids:
+                        raise ValueError("Select at least one OpenAlex profile.")
+                    member_id = add_member(
+                        connection, first_name, last_name, verified_ids
+                    )
+                    # Caching an OpenAlex profile is optional: a cache error
+                    # must never make an already-created member appear to fail.
+                    cache_errors = []
+                    for candidate in candidate_results:
+                        identifier = str(candidate.get("id") or "").split("/")[-1]
+                        if identifier in verified_ids:
+                            try:
+                                save_author_profile(connection, identifier, candidate)
+                            except Exception as error:
+                                cache_errors.append(f"{identifier}: {error}")
+                    st.session_state["selected_member_id"] = member_id
+                    st.session_state["reset_add_member"] = True
+                    st.session_state.pop("member_candidate_results", None)
+                    st.session_state.pop("member_candidate_query", None)
+                    message = f"Researcher added (#{member_id})."
+                    if cache_errors:
+                        message += (
+                            " Author-profile caching could not be completed; "
+                            "refresh aliases later in Team."
+                        )
+                    report_and_reload(message)
+                except Exception as error:
+                    st.error(str(error))
+        elif st.session_state.get("member_candidate_query") == current_query and has_name:
+            st.info("No OpenAlex profiles found. Try a different name spelling.")
+        else:
+            st.caption("Find a matching OpenAlex profile before adding a researcher.")
 
     with right:
         st.markdown("#### Edit a member")
@@ -395,6 +475,34 @@ def render_team_tab(connection, members: list[dict], labels: dict[int, str]) -> 
                 report_and_reload("Researcher removed; publications retained.")
 
 
+    with st.expander("OpenAlex author names and aliases"):
+        st.write(
+            "Paperazzi uses exact normalized OpenAlex display-name alternatives "
+            "to match BibTeX bylines to team members. Shared aliases are not "
+            "assigned automatically; review matches before reporting."
+        )
+        st.caption(
+            f"{len(cached_alias_index(connection))} unique normalized names cached "
+            f"(including roster names)."
+        )
+        if st.button("Refresh OpenAlex author profiles", key="refresh_aliases"):
+            completed, failures = 0, []
+            for member in members:
+                for identifier in member["openalex_ids"]:
+                    try:
+                        profile = sources.openalex_author_profile(
+                            identifier, options["api_key"], options["email"]
+                        )
+                        save_author_profile(connection, identifier, profile)
+                        completed += 1
+                    except Exception as error:
+                        failures.append(f"{identifier}: {error}")
+            if failures:
+                st.warning("Some author profiles could not be refreshed:\n\n" +
+                           "\n\n".join(failures))
+            st.success(f"Updated {completed} OpenAlex profiles.")
+
+
 def synchronize_openalex(
     connection,
     members: list[dict],
@@ -428,6 +536,16 @@ def synchronize_openalex(
             if empty:
                 skipped.append(f"{person['name']} ({author_id}): no overlapping years")
                 continue
+
+            # Store the displayed and alternative names for later BibTeX imports.
+            # A profile lookup failure should not prevent importing its works.
+            try:
+                save_author_profile(
+                    connection, author_id,
+                    sources.openalex_author_profile(author_id, api_key, email),
+                )
+            except Exception as error:
+                failures.append(f"{person['name']} aliases ({author_id}): {error}")
 
             records = sources.openalex_works(
                 author_id=author_id,
@@ -486,12 +604,13 @@ def render_import_tab(connection, members: list[dict], labels: dict, options: di
             "Maximum records per Author ID", 100, 10000, 2000, step=100
         )
         limit_period = st.checkbox(
-            "Also limit imports to the team-wide reporting period",
+            "Download only publications within the reporting period",
             value=False,
             disabled=options["all_years"],
             help=(
-                "Individual member year bounds always apply; the global period "
-                "is an optional additional restriction during import."
+                "When disabled, all publications within each member's individual year "
+                "limits are downloaded. The reporting period only affects displayed results, "
+                "statistics, and exports."
             ),
         )
         st.caption(
@@ -536,6 +655,21 @@ def render_import_tab(connection, members: list[dict], labels: dict, options: di
         )
 
         if st.button("Import files", disabled=not uploaded_files, use_container_width=True):
+            # Previously cached aliases remain available offline. Fetch only
+            # profiles that have never been cached, rather than every upload.
+            unavailable = []
+            if options["api_key"]:
+                for identifier in missing_author_profiles(connection):
+                    try:
+                        profile = sources.openalex_author_profile(
+                            identifier, options["api_key"], options["email"]
+                        )
+                        save_author_profile(connection, identifier, profile)
+                    except Exception as error:
+                        unavailable.append(f"{identifier}: {error}")
+            if unavailable:
+                st.warning("Some OpenAlex author aliases were unavailable:\n\n" +
+                           "\n\n".join(unavailable))
             summaries = []
             for uploaded in uploaded_files:
                 try:
@@ -558,8 +692,10 @@ def render_import_tab(connection, members: list[dict], labels: dict, options: di
                 report_and_reload(". ".join(summaries))
 
         st.info(
-            "BibTeX entries such as **@incollection** (book chapters) and "
-            "**@patent** (patents) are supported."
+            "BibTeX entries such as **@incollection** and **@patent** are "
+            "supported. Author names are compared against cached OpenAlex "
+            "display-name alternatives (accent- and case-insensitive), and "
+            "unambiguous matches are assigned automatically."
         )
 
     st.divider()
@@ -630,6 +766,43 @@ def render_import_tab(connection, members: list[dict], labels: dict, options: di
                 )
         else:
             st.caption("No search results loaded.")
+
+    st.divider()
+    st.markdown("#### Enrich bibliographic details from Crossref")
+    st.caption(
+        "For publications with a DOI, Crossref may supply missing volume, issue, "
+        "pages, publication month, publisher and other citation metadata. "
+        "This is an explicit operation and does not change manual corrections."
+    )
+    enrich_limit = st.number_input(
+        "Maximum DOI lookups", min_value=1, max_value=1000, value=100,
+        key="crossref_enrichment_limit",
+    )
+    if st.button("Enrich records with Crossref"):
+        # Only look up works that do not already have a Crossref source record.
+        targets = connection.execute(
+            """SELECT w.doi FROM works w WHERE w.doi IS NOT NULL AND w.doi != ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM variants v
+                   WHERE v.work_id=w.id AND v.source='crossref'
+               ) LIMIT ?""", (int(enrich_limit),)
+        ).fetchall()
+        progress = st.progress(0.0)
+        added, errors = 0, []
+        for index, target in enumerate(targets, 1):
+            try:
+                record = sources.crossref_by_doi(target["doi"], options["email"])
+                add_records(connection, [record])
+                added += 1
+            except Exception as error:
+                errors.append(f"{target['doi']}: {error}")
+                if "rate limit" in str(error).lower() or "429" in str(error):
+                    break  # Stop rather than repeatedly retrying a throttled API.
+            progress.progress(index / len(targets))
+        if errors:
+            st.warning(f"{len(errors)} Crossref requests failed. First errors: " +
+                       "; ".join(errors[:5]))
+        report_and_reload(f"Enriched {added} works with Crossref.")
 
     st.divider()
     st.markdown("#### Find a publication by title or DOI")
@@ -713,6 +886,10 @@ def render_library_tab(
                     "Year": work["year"],
                     "BibTeX type": work["bibtex_type"],
                     "Title": work["title"],
+                    "Volume": work.get("volume"),
+                    "Issue": work.get("number"),
+                    "Pages": work.get("pages"),
+                    "Month": work.get("month"),
                     "Team members": work["team_members"],
                     "Citations*": work["citations"],
                     "DOI": work["doi"],
@@ -771,6 +948,21 @@ def render_library_tab(
     )
     st.write(work.get("authors") or "Authors not available")
 
+    with st.expander("Bibliographic metadata", expanded=False):
+        st.dataframe(
+            pd.DataFrame([
+                {"Field": field.replace("_", " ").title(), "Value": work.get(field) or "—"}
+                for field in (
+                    "volume", "number", "pages", "month", "publication_date",
+                    "publisher", "issn", "isbn", "url", "edition",
+                )
+            ]),
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption("Values are consolidated from the available source records. "
+                   "The complete original metadata remains accessible in the source variants.")
+
     with st.form(f"edit_work_{publication_id}"):
         title_col, year_col, type_col = st.columns([3, 1, 1.5])
         revised_title = title_col.text_input(
@@ -783,10 +975,26 @@ def render_library_tab(
         )
         available_types = ["Automatic"] + sorted(set(BIBTEX_TYPES) - {"conference"})
         current_type = work.get("bibtex_type_override") or "Automatic"
+        inferred_type = work.get("bibtex_type_inferred") or "misc"
+
+        def type_option_label(entry_type: str) -> str:
+            """Explain source-inferred types and the dataset-specific category."""
+            if entry_type == "Automatic":
+                return f"Automatic (@{inferred_type}, from sources)"
+            if entry_type == "dataset":
+                return "@dataset — Dataset / database"
+            return f"@{entry_type}"
+
         revised_type = type_col.selectbox(
-            "BibTeX type",
+            "Publication type (BibTeX / BibLaTeX)",
             available_types,
             index=available_types.index(current_type) if current_type in available_types else 0,
+            format_func=type_option_label,
+            help=(
+                "Choose a type to override the source metadata, for example @article "
+                "instead of @misc. Use @dataset for research datasets and databases. "
+                "The correction survives future imports; Automatic restores source detection."
+            ),
         )
         credited_members = st.multiselect(
             "Contributing team members (all years)",
@@ -862,7 +1070,7 @@ def render_reconcile_tab(
     )
 
     threshold = st.slider(
-        "Title similarity threshold", 0.65, 0.98, 0.82,
+        "Title similarity threshold", 0.65, 0.98, 0.75,
         step=0.01, key="reconcile_threshold",
     )
     candidates = works[:1200]
@@ -1061,8 +1269,9 @@ def render_statistics_tab(
 
     # A separate category summary includes book chapters independently of 'Other'.
     st.markdown("#### Publication categories")
-    columns = st.columns(4)
-    for column, category in zip(columns, ("Articles", "Proceedings", "Book Chapters", "Patents")):
+    report_categories = ("Articles", "Proceedings", "Book Chapters", "Datasets / Databases", "Patents")
+    columns = st.columns(len(report_categories))
+    for column, category in zip(columns, report_categories):
         column.metric(category, len(category_works(selected_works, category)))
 
     # OpenAlex exposes counts_by_year: the year refers to the citation event,
@@ -1167,8 +1376,9 @@ def render_export_tab(connection, works: list[dict], members: list[dict]) -> Non
     )
 
     st.markdown("#### Category-specific CSV exports")
-    columns = st.columns(4)
-    for column, category in zip(columns, ("Articles", "Proceedings", "Book Chapters", "Patents")):
+    export_categories = ("Articles", "Proceedings", "Book Chapters", "Datasets / Databases", "Patents")
+    columns = st.columns(len(export_categories))
+    for column, category in zip(columns, export_categories):
         column.download_button(
             f"↓ {category} CSV",
             team_csv_export(category_works(works, category)),
@@ -1223,11 +1433,11 @@ def main() -> None:
         for warning in st.session_state.pop("sync_warnings", []):
             st.warning(warning)
 
-        metrics = st.columns(6)
+        metrics = st.columns(7)
         metrics[0].metric("Selected members", len(options["selected_members"]))
         metrics[1].metric("Unique publications", len(selected_works))
         for index, category in enumerate(
-            ("Articles", "Proceedings", "Book Chapters", "Patents"), start=2
+            ("Articles", "Proceedings", "Book Chapters", "Datasets / Databases", "Patents"), start=2
         ):
             metrics[index].metric(category, len(category_works(selected_works, category)))
 
@@ -1253,7 +1463,7 @@ def main() -> None:
         # database or construct interactive widgets during another workflow.
         if pages[0].open:
             with pages[0]:
-                render_team_tab(connection, members, labels)
+                render_team_tab(connection, members, labels, options)
         if pages[1].open:
             with pages[1]:
                 render_import_tab(connection, members, labels, options)

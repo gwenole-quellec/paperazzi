@@ -8,11 +8,13 @@ Built with **Python**, **Streamlit**, and **SQLite**, Paperazzi runs in your bro
 
 ## Features
 
-- **Team roster:** Register researchers using one or more OpenAlex Author IDs and set optional publication-year limits for each member.
+- **Team roster:** Add researchers by name, search OpenAlex, and verify at least one candidate author profile before saving. Configure optional publication-year limits afterwards in the member editor.
 - **Bibliographic imports:** Synchronize [OpenAlex](https://openalex.org/) author profiles, search [Crossref](https://www.crossref.org/), or import `.bib` files from Google Scholar, Zotero, HAL, and other reference managers.
 - **Deduplicated library:** Combine records describing the same work, preserve the original sources, and manually correct remaining mismatches.
-- **Publication categories:** Browse **Articles**, **Proceedings**, **Book Chapters**, **Patents**, and **Other** works, in addition to a consolidated **All** view.
-- **Editable metadata:** Correct titles, years, BibTeX entry types, and team-member assignments; exclude records from reports without deleting them.
+- **Publication categories:** Browse **Articles**, **Proceedings**, **Book Chapters**, **Datasets / Databases**, **Patents**, and **Other** works, in addition to a consolidated **All** view.
+- **Complete source metadata:** Preserve the original source payload and expose standardized volume, issue (`number`), pages, month, publication date, publisher, ISSN, ISBN, URL, and edition fields in SQLite, the Library and exports. Enrich imported DOI records with Crossref on demand.
+- **Name-aware BibTeX imports:** Cache OpenAlex author profiles and alternative bylines, then automatically associate BibTeX entries with unambiguous team members even when names differ in accents, punctuation, or `Family, Given` order.
+- **Editable metadata:** Correct titles, years, BibTeX/BibLaTeX entry types (including `@dataset`), and team-member assignments; exclude records from reports without deleting them.
 - **Team statistics:** Explore unique publications by year and entry type, publications and indexed citations by researcher, available citation counts, h-index, and i10-index.
 - **Exports:** Download the scoped bibliography in CSV or BibTeX format, category-specific CSV files, a team roster, or a detailed JSON reference archive.
 
@@ -61,12 +63,12 @@ An optional contact email can be provided through `PAPERAZZI_EMAIL` or the sideb
 
 ## Getting started
 
-1. **Add team members.** Open **Team**, enter first and last names, and associate one or more OpenAlex Author IDs with each researcher. To change an existing member, **click their row** in the team table and edit the form below. A new database starts with an empty roster.
+1. **Add team members.** Open **Team**, enter first and last names and click **Find OpenAlex candidates**. Review the profiles (affiliations and publication counts), select at least one matching OpenAlex Author ID, and click **Add researcher**. This button is disabled until a profile has been selected. To set individual publication-year limits or later edit IDs, **click the member row** in the team table and use the editor. A new database starts with an empty roster.
 2. **Choose your reporting period.** Set the team-wide publication-year range in the sidebar. In **Team**, optionally configure individual start and end years; both are inclusive.
 3. **Synchronize OpenAlex.** In **Import**, choose the researchers to synchronize and run the import. Each member's individual date limits apply to the OpenAlex request. Applying the team-wide period during import is optional.
 4. **Review the library.** Use **Library** to inspect publication categories and team attribution. **Click a publication row** to open its correction form below. This lets you edit its title, publication year, BibTeX type, and team-member attribution, or exclude it from the report.
 5. **Resolve duplicates.** In **Reconcile**, inspect fuzzy title matches and manually merge or split source records. After confirming a merge or split, Paperazzi stays on the Reconcile tab, refreshes the candidate list using the same similarity threshold, and displays the next pair.
-6. **Fill gaps.** Search Crossref and review matching results, or import one or more BibTeX files. Bibliographies containing works from different authors can be imported without assigning every record to a single researcher.
+6. **Fill gaps.** Search Crossref and review matching results, or import one or more BibTeX files. During an import, Paperazzi fetches uncached OpenAlex name alternatives when an API key is available; earlier profile aliases remain usable offline. Bibliographies containing works from different authors can be imported without assigning every record to a single researcher. Use the optional Crossref DOI-enrichment action to complete volume, issue, pagination, and date details.
 7. **Explore and export.** Inspect **Statistics** and download the appropriate files from **Export** or directly from a Library category.
 
 Imports are incremental. Re-importing an existing source record updates its metadata instead of creating another copy. Changes are reflected in the interface after the import finishes. The active main tab is preserved after database updates.
@@ -80,8 +82,11 @@ Paperazzi preserves the effective **BibTeX entry type** of each work. This is ei
 | Articles | `article` | Journal articles |
 | Proceedings | `inproceedings`, `conference` | Papers published in conference proceedings |
 | Book Chapters | `incollection` | Chapters in edited books or collections |
+| Datasets / Databases | `dataset` (BibLaTeX) | Research datasets and scientific databases |
 | Patents | `patent` | Patent records |
 | Other | All remaining types | Books, theses, reports, preprints, and other records |
+
+A research dataset or database can be manually classified as `@dataset` in the Library editor. This type is supported by BibLaTeX (and by Paperazzi imports/exports); classic BibTeX styles may require `@misc` instead. Source-inferred types such as `dataset` and `database` are also mapped to `@dataset`. Manual corrections survive subsequent imports.
 
 An `@incollection` BibTeX entry is retained as a book chapter during import and export. Crossref's `book-chapter` and OpenAlex works identified as book chapters are also mapped to `incollection`. The **Book Chapters** category has its own listing, summary counter, and CSV export.
 
@@ -101,9 +106,13 @@ The global year range filters the Library, Statistics, and bibliographic exports
 
 - **OpenAlex** is the primary automatic source. Team members are identified by their OpenAlex Author IDs (such as `A123456789`). A single person may be associated with multiple IDs if OpenAlex split their profile.
 - **Crossref** provides an optional, manually reviewed search by author name. Name searches can include namesakes or miss publications with complex author names.
-- **BibTeX** can supplement missing references and preserve explicitly specified entry types, including `@incollection` and `@patent`.
+- **BibTeX** can supplement missing references and preserve explicitly specified entry types, including `@incollection` and `@patent`. Team assignments use cached OpenAlex `display_name` and `display_name_alternatives` as well as roster names. Only exact normalized matches are accepted; names shared by several team members are deliberately skipped. The original author list is retained and manual corrections take precedence.
+
+Original metadata is preserved in `variants.raw_json`, including provider-specific attributes that do not have their own SQLite columns. Common citation fields (`volume`, `number`, `pages`, `month`, `publication_date`, `publisher`, `issn`, `isbn`, `url`, `edition`) are projected into the canonical publication, CSV, and BibTeX exports. Where several sources disagree, Crossref is preferred for issue-level details while other sources fill empty fields. Existing databases recover these details from already stored source JSON on the first launch, without re-importing every record.
 
 Matching uses identical DOIs, OpenAlex Work IDs, or strictly normalized titles with matching publication years. Similar titles are **suggestions**, not automatic merges. Each consolidated work retains its individual source records so that decisions can be reviewed later.
+
+Author-profile name aliases are stored locally in the `author_profiles` table. They are attached to OpenAlex IDs, not free-floating names, and are refreshed during synchronization or on demand in **Team**. Manual contributor lists override automatic matching, including any future alias updates.
 
 The citation count is selected from one available source according to a fixed priority; counts from different sources are **not summed**. Bibliometric indicators depend on source coverage and should be reviewed before inclusion in an official report.
 
@@ -111,7 +120,9 @@ The citation count is selected from one available source according to a fixed pr
 
 - OpenAlex is not an exhaustive patent database. Importing `@patent` BibTeX entries is a practical way to complete a patent inventory; no patent-office connector is provided.
 - Conference proceedings and book chapters may be misclassified by upstream services; corrections are available in the Library.
-- Importing a mixed BibTeX bibliography with several members selected assigns **all** of its entries to **every** selected member. Leave the assignment empty for mixed files and verify records individually.
+- Importing a mixed BibTeX bibliography with several members selected assigns **all** of its entries to **every** selected member. Leave the assignment empty for mixed files to use OpenAlex aliases and verify records individually.
+- OpenAlex alternative bylines can themselves contain incorrect names. Exact matching reduces accidental attributions but cannot guarantee them; double-check ambiguous authorships, especially before official evaluations. An alias can be refreshed in **Team**, and a manual correction survives a subsequent import.
+- Crossref does not provide every bibliographic field for every work. DOI enrichment is optional, makes one API request per DOI, and may be subject to rate limits.
 - A publication without a known year is omitted when bounded year filters apply.
 - The JSON export is a detailed reference archive and **cannot yet be restored** directly through the interface.
 

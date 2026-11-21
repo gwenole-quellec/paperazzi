@@ -25,6 +25,7 @@ from .core import (
     connect,
     get_works,
     get_variants,
+    normalize_title,
     upsert_records,
 )
 
@@ -60,6 +61,103 @@ def parse_author_ids(value: str | Iterable[str]) -> list[str]:
     return identifiers
 
 
+
+def normalize_author_name(name: str) -> str:
+    """Canonicalize a byline, including BibTeX's ``Family, Given`` spelling.
+
+    Only exact normalized aliases are matched, never guessed initials or
+    partial surnames. This intentionally favors precision over recall.
+    """
+    text = str(name or "").strip()
+    # Simple TeX accent commands are common in Google Scholar BibTeX exports.
+    # Decode them before removing braces and normalizing Unicode accents.
+    accent_marks = {"'": "\u0301", "`": "\u0300", '^': "\u0302",
+                    '"': "\u0308", '~': "\u0303", 'c': "\u0327"}
+    for symbol, combining in accent_marks.items():
+        text = re.sub(
+            r"\\" + re.escape(symbol) + r"\s*\{?([A-Za-z])\}?",
+            lambda match: match.group(1) + combining,
+            text,
+        )
+    text = text.replace("{", "").replace("}", "")
+    if "," in text:
+        family, given = text.split(",", 1)
+        text = f"{given.strip()} {family.strip()}"
+    return normalize_title(text)
+
+
+def cached_alias_index(connection) -> dict[str, int]:
+    """Map unambiguous OpenAlex bylines and roster names to team members.
+
+    OpenAlex alternative bylines can be noisy and shared by namesakes.
+    Duplicated normalized aliases are deliberately excluded from automatic
+    assignment until a person explicitly reviews the publication.
+    """
+    names = defaultdict(set)
+    members = list_members(connection)
+    for member in members:
+        names[normalize_author_name(member["name"])].add(member["id"])
+        for author_id in member["openalex_ids"]:
+            profile = connection.execute(
+                "SELECT aliases_json FROM author_profiles WHERE openalex_id=?",
+                (author_id,),
+            ).fetchone()
+            if profile:
+                for alias in json.loads(profile["aliases_json"]):
+                    names[normalize_author_name(alias)].add(member["id"])
+    return {alias: next(iter(owners)) for alias, owners in names.items()
+            if alias and len(owners) == 1}
+
+
+def save_author_profile(connection, author_id: str, profile: dict) -> None:
+    """Cache OpenAlex name alternatives and reindex existing BibTeX records.
+
+    The cache belongs to the OpenAlex ID rather than a member, preventing
+    stale aliases from being reused after a member's IDs are changed.
+    """
+    identifier = normalized_author_id(author_id)
+    names = [profile.get("display_name"),
+             *(profile.get("display_name_alternatives") or [])]
+    cleaned = sorted({str(name).strip() for name in names if name})
+    with connection:
+        connection.execute(
+            """INSERT INTO author_profiles (openalex_id, aliases_json)
+               VALUES (?,?) ON CONFLICT(openalex_id)
+               DO UPDATE SET aliases_json=excluded.aliases_json""",
+            (identifier, json.dumps(cleaned, ensure_ascii=False)),
+        )
+        reindex_bibtex_members(connection)
+
+
+def missing_author_profiles(connection, members: list[dict] | None = None) -> list[str]:
+    """List configured author IDs with no cached OpenAlex name alternatives."""
+    registered = members if members is not None else list_members(connection)
+    identifiers = {identifier for member in registered for identifier in member["openalex_ids"]}
+    return sorted(identifier for identifier in identifiers if connection.execute(
+        "SELECT 1 FROM author_profiles WHERE openalex_id=?", (identifier,)
+    ).fetchone() is None)
+
+
+def reindex_bibtex_members(connection) -> None:
+    """Rebuild *only* inferred BibTeX name evidence; keep manual decisions.
+
+    Existing BibTeX variants are rechecked whenever a profile, member or
+    author identifier changes. Ambiguous aliases do not create links.
+    """
+    index = cached_alias_index(connection)
+    connection.execute("DELETE FROM variant_members WHERE evidence='bibtex_alias'")
+    for variant in connection.execute(
+        "SELECT id, authors FROM variants WHERE source IN ('bibtex','scholar_bibtex')"
+    ):
+        for byline in (variant["authors"] or "").split("; "):
+            member_id = index.get(normalize_author_name(byline))
+            if member_id is not None:
+                connection.execute(
+                    """INSERT OR IGNORE INTO variant_members
+                       (variant_id, member_id, evidence) VALUES (?,?,'bibtex_alias')""",
+                    (variant["id"], member_id),
+                )
+
 def connect_team(path: str | Path):
     """Open the local database and create or migrate its team-related tables."""
     connection = connect(path)
@@ -87,6 +185,10 @@ def connect_team(path: str | Path):
             member_id INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
             decision TEXT NOT NULL CHECK(decision IN ('include', 'exclude')),
             PRIMARY KEY(work_id, member_id)
+        );
+        CREATE TABLE IF NOT EXISTS author_profiles (
+            openalex_id TEXT PRIMARY KEY,
+            aliases_json TEXT NOT NULL DEFAULT '[]'
         );
         CREATE INDEX IF NOT EXISTS idx_author_ids_member
             ON author_ids(member_id);
@@ -260,6 +362,7 @@ def add_member(
                 (identifier, member_id),
             )
         _reindex_variant_members(connection, member_id)
+        reindex_bibtex_members(connection)
     return member_id
 
 
@@ -308,12 +411,14 @@ def update_member(
                 (author_id, member_id),
             )
         _reindex_variant_members(connection, member_id)
+        reindex_bibtex_members(connection)
 
 
 def delete_member(connection, member_id: int) -> None:
     """Remove a member and their links; preserve all canonical publications."""
     with connection:
         connection.execute("DELETE FROM members WHERE id=?", (member_id,))
+        reindex_bibtex_members(connection)
 
 
 def _ids_by_member(connection) -> dict[str, int]:
@@ -410,6 +515,8 @@ def add_records(
                        ) VALUES (?,?,?)""",
                     (variant["id"], member_id, evidence),
                 )
+        if any(record.get("source") in {"bibtex", "scholar_bibtex"} for record in records):
+            reindex_bibtex_members(connection)
     return counts
 
 
@@ -466,24 +573,19 @@ def set_work_members(
     if not desired.issubset(valid):
         raise ValueError("A selected team member does not exist")
 
-    automatic = _automatic_member_map(connection).get(work_id, set())
+    # Store explicit decisions for *all* currently registered members. A later
+    # alias refresh may discover more automatic evidence, but it must never
+    # silently override a human-reviewed contributor list.
     with connection:
         connection.execute(
             "DELETE FROM member_work_overrides WHERE work_id=?", (work_id,)
         )
-        for member_id in valid:
-            if member_id in desired and member_id not in automatic:
-                decision = "include"
-            elif member_id in automatic and member_id not in desired:
-                decision = "exclude"
-            else:
-                continue
-            connection.execute(
-                """INSERT INTO member_work_overrides (
-                       work_id, member_id, decision
-                   ) VALUES (?,?,?)""",
-                (work_id, member_id, decision),
-            )
+        connection.executemany(
+            """INSERT INTO member_work_overrides
+               (work_id, member_id, decision) VALUES (?,?,?)""",
+            [(work_id, member_id, "include" if member_id in desired else "exclude")
+             for member_id in valid],
+        )
 
 
 def merge_team_works(connection, destination: int, others: list[int]) -> None:
@@ -567,7 +669,9 @@ def team_csv_export(works: list[dict]) -> bytes:
     """Export one row per canonical work, including credited team members."""
     columns = [
         "id", "title", "authors", "year", "venue", "bibtex_type", "work_type",
-        "doi", "citations", "citation_source", "openalex_id", "team_members",
+        "doi", "volume", "number", "pages", "month", "publication_date",
+        "publisher", "issn", "isbn", "url", "edition",
+        "citations", "citation_source", "openalex_id", "team_members",
         "team_member_count", "sources", "variant_count",
     ]
     buffer = io.StringIO()

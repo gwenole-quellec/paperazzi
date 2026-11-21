@@ -39,6 +39,7 @@ BIBTEX_TYPES = (
     "book",
     "booklet",
     "conference",
+    "dataset",
     "inbook",
     "incollection",
     "inproceedings",
@@ -60,6 +61,9 @@ WORK_TYPE_TO_BIBTEX = {
     "proceedings-article": "inproceedings",
     "conference-paper": "inproceedings",
     "conference": "inproceedings",
+    "dataset": "dataset",
+    "data-set": "dataset",
+    "database": "dataset",
     "book": "book",
     "edited-book": "book",
     "monograph": "book",
@@ -80,6 +84,7 @@ def infer_bibtex_type(source: str, source_type: str | None) -> str:
 
     Explicit types from BibTeX imports take precedence over index mappings.
     ``book-chapter`` and ``book-section`` become ``incollection``.
+    Database/dataset provider types are mapped to BibLaTeX ``dataset``.
     Unknown types are deliberately kept under ``misc`` for manual review.
     """
     kind = str(source_type or "").strip().lower().replace("_", "-")
@@ -147,6 +152,74 @@ def int_or_none(value) -> int | None:
         return None
 
 
+
+# Normalized bibliographic fields are a convenient projection of the complete
+# provider metadata, which is always preserved in ``variants.raw_json``.
+DETAIL_FIELDS = (
+    "volume", "number", "pages", "month", "publication_date",
+    "publisher", "issn", "isbn", "url", "edition",
+)
+
+
+def extract_bibliographic_details(source: str, raw: dict) -> dict[str, str | None]:
+    """Extract common citation fields without discarding provider-specific data.
+
+    OpenAlex stores volume, issue, and pagination under ``biblio``; Crossref
+    uses ``issue`` and ``page``. BibTeX already exposes the target field names.
+    Unavailable fields remain ``None`` rather than fabricated placeholders.
+    """
+    def cleaned(value):
+        if isinstance(value, list):
+            value = ", ".join(str(part) for part in value if part)
+        return str(value).strip() if value not in (None, "", []) else None
+
+    if source == "openalex":
+        biblio = raw.get("biblio") or {}
+        start, end = cleaned(biblio.get("first_page")), cleaned(biblio.get("last_page"))
+        pages = f"{start}--{end}" if start and end and start != end else start or end
+        date = cleaned(raw.get("publication_date"))
+        month = date.split("-")[1] if date and len(date.split("-")) >= 2 else None
+        location = raw.get("primary_location") or {}
+        journal = location.get("source") or {}
+        data = {
+            "volume": biblio.get("volume"), "number": biblio.get("issue"),
+            "pages": pages, "month": month, "publication_date": date,
+            "publisher": journal.get("host_organization_name"),
+            "issn": journal.get("issn_l") or journal.get("issn"),
+            "isbn": None, "url": raw.get("doi") or raw.get("id"),
+            "edition": None,
+        }
+    elif source == "crossref":
+        date_parts = ((raw.get("published") or raw.get("issued") or
+                       raw.get("created") or {}).get("date-parts") or [[]])[0]
+        date = "-".join(f"{int(value):0{4 if index == 0 else 2}d}"
+                        for index, value in enumerate(date_parts[:3])) if date_parts else None
+        data = {
+            "volume": raw.get("volume"), "number": raw.get("issue"),
+            "pages": raw.get("page") or raw.get("article-number"),
+            "month": date_parts[1] if len(date_parts) > 1 else None,
+            "publication_date": date, "publisher": raw.get("publisher"),
+            "issn": raw.get("ISSN"), "isbn": raw.get("ISBN"),
+            "url": raw.get("URL"), "edition": raw.get("edition"),
+        }
+    else:
+        data = {key: raw.get(key) for key in DETAIL_FIELDS}
+        if source in {"bibtex", "scholar_bibtex"}:
+            data["number"] = raw.get("number") or raw.get("issue")
+            data["pages"] = raw.get("pages") or raw.get("page")
+            data["url"] = raw.get("url") or raw.get("doi")
+    return {key: cleaned(data.get(key)) for key in DETAIL_FIELDS}
+
+
+def _variant_details(record: dict, source: str, raw: dict) -> dict:
+    """Fill absent normalized metadata from the untouched source response."""
+    extracted = extract_bibliographic_details(source, raw)
+    return {
+        field: record.get(field) if record.get(field) not in (None, "", [])
+        else extracted[field]
+        for field in DETAIL_FIELDS
+    }
+
 def connect(path: str | Path) -> sqlite3.Connection:
     """Open SQLite, create missing tables, and migrate older databases safely."""
     database_path = Path(path)
@@ -202,6 +275,36 @@ def connect(path: str | Path) -> sqlite3.Connection:
         """
     )
 
+    # Keep schema extensions explicit: existing databases are migrated in place.
+    for table in ("works", "variants"):
+        existing = {
+            row["name"] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        for field in DETAIL_FIELDS:
+            if field not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {field} TEXT")
+
+    # Old imports retained the complete original responses: recover all newly
+    # exposed fields without requiring another network synchronization.
+    rows = connection.execute("SELECT * FROM variants").fetchall()
+    changed_works = set()
+    for row in rows:
+        if all(row[field] not in (None, "") for field in DETAIL_FIELDS):
+            continue
+        try:
+            raw = json.loads(row["raw_json"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        extracted = extract_bibliographic_details(row["source"], raw)
+        updates = {field: extracted[field] for field in DETAIL_FIELDS
+                   if not row[field] and extracted[field]}
+        if updates:
+            connection.execute(
+                f"UPDATE variants SET {', '.join(field + '=?' for field in updates)} WHERE id=?",
+                (*updates.values(), row["id"]),
+            )
+            changed_works.add(row["work_id"])
+
     # SQLite's ALTER TABLE ADD COLUMN preserves existing works, variants,
     # manual corrections, and team membership relationships.
     migrations = {
@@ -232,6 +335,8 @@ def connect(path: str | Path) -> sqlite3.Connection:
     for row in incomplete_works:
         rebuild(connection, row["id"])
 
+    for work_id in changed_works:
+        rebuild(connection, work_id)
     connection.commit()
     return connection
 
@@ -259,6 +364,15 @@ def rebuild(connection: sqlite3.Connection, work_id: int) -> None:
         "title", "year", "doi", "venue", "authors", "work_type", "openalex_id", "s2_id"
     )
     selected = {field: _pick(variants, field) for field in fields}
+    # Crossref generally supplies authoritative issue-level metadata;
+    # the other sources fill gaps, independently for each field.
+    by_details_priority = sorted(
+        variants,
+        key=lambda variant: {"crossref": 0, "bibtex": 1, "scholar_bibtex": 1,
+                             "openalex": 2}.get(variant["source"], 9),
+    )
+    details = {field: next((variant[field] for variant in by_details_priority
+                            if variant.get(field)), None) for field in DETAIL_FIELDS}
     entry_type = choose_bibtex_type(variants)
     by_citation_priority = sorted(
         variants, key=lambda item: CITATION_PRIORITY.get(item["source"], 99)
@@ -272,15 +386,16 @@ def rebuild(connection: sqlite3.Connection, work_id: int) -> None:
     source = citation_variant["source"] if citation_variant else ""
 
     connection.execute(
-        """UPDATE works SET
+        f"""UPDATE works SET
                title=?, year=?, doi=?, venue=?, authors=?, work_type=?,
-               bibtex_type=?, citations=?, citation_source=?, openalex_id=?, s2_id=?
+               bibtex_type=?, citations=?, citation_source=?, openalex_id=?, s2_id=?,
+               {', '.join(field + '=?' for field in DETAIL_FIELDS)}
            WHERE id=?""",
         (
             selected["title"] or "", selected["year"], selected["doi"],
             selected["venue"], selected["authors"], selected["work_type"],
             entry_type, count, source, selected["openalex_id"],
-            selected["s2_id"], work_id,
+            selected["s2_id"], *(details[field] for field in DETAIL_FIELDS), work_id,
         ),
     )
 
@@ -348,9 +463,9 @@ def upsert_records(connection: sqlite3.Connection, records: Iterable[dict]) -> d
         authors = record.get("authors")
         authors = "; ".join(authors) if isinstance(authors, list) else (authors or "")
         entry_type = infer_bibtex_type(source, record.get("work_type"))
-        raw_json = json.dumps(
-            record.get("raw", record), ensure_ascii=False, default=str
-        )
+        raw = record.get("raw", record)
+        raw_json = json.dumps(raw, ensure_ascii=False, default=str)
+        details = _variant_details(record, source, raw)
 
         previous = connection.execute(
             "SELECT id, work_id FROM variants WHERE source=? AND source_id=?",
@@ -360,6 +475,7 @@ def upsert_records(connection: sqlite3.Connection, records: Iterable[dict]) -> d
             title, year, doi, record.get("venue"), authors,
             record.get("work_type"), entry_type, citations,
             openalex_id, record.get("s2_id"), raw_json,
+            *(details[field] for field in DETAIL_FIELDS),
         )
 
         if previous:
@@ -368,8 +484,10 @@ def upsert_records(connection: sqlite3.Connection, records: Iterable[dict]) -> d
                 """UPDATE variants SET
                        title=?, year=?, doi=?, venue=?, authors=?, work_type=?,
                        bibtex_type=?, citations=?, openalex_id=?, s2_id=?,
-                       raw_json=?, updated_at=datetime('now')
-                   WHERE id=?""",
+                       raw_json=?,
+                       {detail_setters}, updated_at=datetime('now')
+                   WHERE id=?""".replace("{detail_setters}",
+                       ", ".join(field + "=?" for field in DETAIL_FIELDS)),
                 (*fields, previous["id"]),
             )
             totals["updated_variants"] += 1
@@ -385,8 +503,11 @@ def upsert_records(connection: sqlite3.Connection, records: Iterable[dict]) -> d
                 """INSERT INTO variants (
                        work_id, source, source_id, title, year, doi, venue,
                        authors, work_type, bibtex_type, citations,
-                       openalex_id, s2_id, raw_json
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       openalex_id, s2_id, raw_json,
+                       {detail_fields}
+                   ) VALUES ({placeholders})""".replace(
+                       "{detail_fields}", ", ".join(DETAIL_FIELDS)
+                   ).replace("{placeholders}", ",".join("?" for _ in range(14 + len(DETAIL_FIELDS)))),
                 (work_id, source, source_id, *fields),
             )
             totals["new_variants"] += 1
@@ -546,7 +667,7 @@ def csv_export(works: list[dict]) -> bytes:
     """Export canonical records to UTF-8 CSV with an Excel-friendly BOM."""
     columns = [
         "id", "title", "authors", "year", "venue", "work_type", "bibtex_type",
-        "doi", "citations", "citation_source", "openalex_id", "sources", "variant_count",
+        "doi", *DETAIL_FIELDS, "citations", "citation_source", "openalex_id", "sources", "variant_count",
     ]
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=columns, extrasaction="ignore")
@@ -558,8 +679,8 @@ def csv_export(works: list[dict]) -> bytes:
 def bibtex_export(works: list[dict]) -> bytes:
     """Export canonical works using their effective BibTeX types.
 
-    In particular, book chapters are written as ``@incollection`` with their
-    containing book or collection in the ``booktitle`` field.
+    Book chapters are written as ``@incollection`` with their containing book
+    in ``booktitle``. Datasets are exported as BibLaTeX ``@dataset`` entries.
     """
     def escape_braces(value) -> str:
         return str(value or "").replace("{", r"\{").replace("}", r"\}")
@@ -584,6 +705,9 @@ def bibtex_export(works: list[dict]) -> bytes:
         elif work.get("venue"):
             fields["note"] = work["venue"]
         fields["doi"] = work.get("doi")
+        for field in DETAIL_FIELDS:
+            if work.get(field):
+                fields[field] = work[field]
 
         lines = [f"@{entry_type}{{{key}_w{work['id']},"]
         lines.extend(
