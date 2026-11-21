@@ -525,6 +525,44 @@ def merge_team_works(connection, destination: int, others: list[int]) -> None:
         merge_works(connection, destination, others)
 
 
+
+def summarize_member_impact(
+    works: list[dict],
+    selected_member_ids: Iterable[int],
+    labels: dict[int, str],
+) -> list[dict]:
+    """Summarize credited publications and indexed citations for each member.
+
+    ``works`` must already have been filtered by ``scope_team_works``. In
+    particular, its ``member_ids`` contain only selected contributors whose
+    individual publication-year windows include that work. The citation count
+    of a shared publication is credited in full to each eligible coauthor,
+    but only once to any one researcher. Consequently, totals summed across
+    researchers can exceed the deduplicated team's publication/citation totals.
+
+    Members with no eligible publications are included with zero values.
+    """
+    summaries = {
+        member_id: {
+            "Researcher": labels[member_id],
+            "Publications": 0,
+            "Citations": 0,
+        }
+        for member_id in dict.fromkeys(selected_member_ids)
+        if member_id in labels
+    }
+
+    for work in works:
+        citations = int(work.get("citations") or 0)
+        for member_id in set(work.get("member_ids") or ()):
+            if member_id not in summaries:
+                continue
+            summaries[member_id]["Publications"] += 1
+            summaries[member_id]["Citations"] += citations
+
+    return list(summaries.values())
+
+
 def team_csv_export(works: list[dict]) -> bytes:
     """Export one row per canonical work, including credited team members."""
     columns = [

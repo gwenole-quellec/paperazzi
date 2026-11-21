@@ -13,13 +13,14 @@ Built with **Python**, **Streamlit**, and **SQLite**, Paperazzi runs in your bro
 - **Deduplicated library:** Combine records describing the same work, preserve the original sources, and manually correct remaining mismatches.
 - **Publication categories:** Browse **Articles**, **Proceedings**, **Book Chapters**, **Patents**, and **Other** works, in addition to a consolidated **All** view.
 - **Editable metadata:** Correct titles, years, BibTeX entry types, and team-member assignments; exclude records from reports without deleting them.
-- **Team statistics:** Explore unique publications by year and entry type, contributions by researcher, available citation counts, h-index, and i10-index.
+- **Team statistics:** Explore unique publications by year and entry type, publications and indexed citations by researcher, available citation counts, h-index, and i10-index.
 - **Exports:** Download the scoped bibliography in CSV or BibTeX format, category-specific CSV files, a team roster, or a detailed JSON reference archive.
 
 ## Requirements
 
 - Python **3.10 or later** (3.11 or 3.12 recommended)
 - Internet access for installing dependencies and using online bibliographic APIs
+- **Streamlit 1.55 or later**, installed through `requirements.txt`
 - An **OpenAlex API key** for OpenAlex synchronization
 
 ## Installation
@@ -37,7 +38,7 @@ cd paperazzi
 ./start.sh
 ```
 
-The launcher creates a `.venv` directory and installs the required packages on first use. Open **http://localhost:8501** in a browser.
+The launcher creates a `.venv` directory and installs the required packages on first use. When upgrading an existing installation, it also upgrades an outdated Streamlit version so that tab selection survives a refresh. Open **http://localhost:8501** in a browser.
 
 Alternatively, create a virtual environment manually and start Streamlit:
 
@@ -60,15 +61,15 @@ An optional contact email can be provided through `PAPERAZZI_EMAIL` or the sideb
 
 ## Getting started
 
-1. **Add team members.** Open **Team**, enter first and last names, and associate one or more OpenAlex Author IDs with each researcher. A new database starts with an empty roster.
+1. **Add team members.** Open **Team**, enter first and last names, and associate one or more OpenAlex Author IDs with each researcher. To change an existing member, **click their row** in the team table and edit the form below. A new database starts with an empty roster.
 2. **Choose your reporting period.** Set the team-wide publication-year range in the sidebar. In **Team**, optionally configure individual start and end years; both are inclusive.
 3. **Synchronize OpenAlex.** In **Import**, choose the researchers to synchronize and run the import. Each member's individual date limits apply to the OpenAlex request. Applying the team-wide period during import is optional.
-4. **Review the library.** Use **Library** to inspect publication categories and team attribution. Correct or exclude records where needed.
-5. **Resolve duplicates.** In **Reconcile**, inspect fuzzy title matches and manually merge or split source records.
+4. **Review the library.** Use **Library** to inspect publication categories and team attribution. **Click a publication row** to open its correction form below. This lets you edit its title, publication year, BibTeX type, and team-member attribution, or exclude it from the report.
+5. **Resolve duplicates.** In **Reconcile**, inspect fuzzy title matches and manually merge or split source records. After confirming a merge or split, Paperazzi stays on the Reconcile tab, refreshes the candidate list using the same similarity threshold, and displays the next pair.
 6. **Fill gaps.** Search Crossref and review matching results, or import one or more BibTeX files. Bibliographies containing works from different authors can be imported without assigning every record to a single researcher.
 7. **Explore and export.** Inspect **Statistics** and download the appropriate files from **Export** or directly from a Library category.
 
-Imports are incremental. Re-importing an existing source record updates its metadata instead of creating another copy. Changes are reflected in the interface after the import finishes.
+Imports are incremental. Re-importing an existing source record updates its metadata instead of creating another copy. Changes are reflected in the interface after the import finishes. The active main tab is preserved after database updates.
 
 ## Publication categories
 
@@ -92,7 +93,7 @@ A single publication coauthored by several team members is stored **once** in th
 
 Individual start and end years refer strictly to the **publication year**: they do not validate institutional affiliation or employment dates. For example, a member configured for 2024–2026 can be credited for a 2024 paper, but not a 2023 paper. A paper counts in the team total if at least one selected member is eligible for its publication year.
 
-The sum of individual contributions may therefore exceed the number of unique team publications. Former members can remain part of a historical reporting period regardless of their current active/inactive status.
+The sum of individual contributions may therefore exceed the number of unique team publications. Citation totals per member are calculated by crediting each eligible coauthor with the full current citation count of each of their publications; they are not divided among coauthors. As a result, the sum of individual citation totals can also exceed the team total. The Statistics page displays publication types and annual publication counts in the first chart row, followed by publications and citations by member in the second row. Former members can remain part of a historical reporting period regardless of their current active/inactive status.
 
 The global year range filters the Library, Statistics, and bibliographic exports. Individual limits apply to OpenAlex synchronization; an option can additionally limit import to the global range. Changing the reporting period never deletes already stored records.
 
@@ -124,7 +125,11 @@ data/paperazzi.sqlite
 
 Set `PAPERAZZI_DB` to use another path. The `data/` path is excluded from version control by `.gitignore`.
 
-For a restorable backup, **stop Paperazzi** and copy the SQLite file to a safe location.
+For a restorable backup, **stop Paperazzi** and copy the SQLite file to a safe location:
+
+```bash
+cp data/paperazzi.sqlite data/paperazzi.sqlite.bak
+```
 
 Existing team and publication data remain available when updating the application files. Avoid distributing personal team databases or API keys with the source code.
 
@@ -138,7 +143,6 @@ paperazzi/
 │   ├── sources.py          # OpenAlex, Crossref, and BibTeX adapters
 │   └── team.py             # Team membership, attribution, and report scope
 ├── .streamlit/config.toml  # Streamlit configuration
-├── .github/workflows/      # CI test workflow
 ├── start.sh
 ├── requirements.txt
 ├── LICENSE

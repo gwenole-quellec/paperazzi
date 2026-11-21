@@ -14,13 +14,16 @@ import hashlib
 import json
 import os
 from collections import Counter
+from functools import partial
 from pathlib import Path
 
 import pandas as pd
+from pandas.io.formats.style import Styler
 import plotly.express as px
 import streamlit as st
 
 from paperazzi import sources
+from paperazzi.ui_selection import selected_row_identifier
 from paperazzi.core import (
     BIBTEX_TYPES,
     bibtex_export,
@@ -43,6 +46,7 @@ from paperazzi.team import (
     member_import_bounds,
     merge_team_works,
     scope_team_works,
+    summarize_member_impact,
     set_work_members,
     team_csv_export,
     team_json_export,
@@ -80,11 +84,43 @@ STYLE = """
 """
 
 
-def report_and_reload(message: str) -> None:
-    """Show a confirmation on the next run and refresh database-backed views."""
-    st.session_state.pop("duplicate_suggestions", None)
+def report_and_reload(message: str, *, clear_duplicate_suggestions: bool = True) -> None:
+    """Refresh database-backed views without disrupting the current tab.
+
+    A source import invalidates earlier duplicate searches, while a merge or
+    split recomputes the suggestions before calling this function. In that
+    case, retaining the refreshed list allows successive merges without
+    asking the user to launch the duplicate search again.
+    """
+    if clear_duplicate_suggestions:
+        st.session_state.pop("duplicate_suggestions", None)
     st.session_state["report"] = message
     st.rerun()
+
+
+def refresh_duplicate_suggestions(connection, members: list[dict], options: dict) -> None:
+    """Recompute an existing duplicate search within the current report scope.
+
+    The same global years, individual member ranges and membership filters
+    apply before and after a merge, so old publications do not unexpectedly
+    appear among the next candidate pairs.
+    """
+    if "duplicate_suggestions" not in st.session_state:
+        return
+
+    current_works = get_team_works(connection, include_excluded=True)
+    scoped_works = scope_team_works(
+        current_works,
+        members,
+        options["selected_members"],
+        options["year_from"],
+        options["year_to"],
+        include_unassigned=options["include_unassigned"],
+    )
+    threshold = st.session_state.get("reconcile_threshold", 0.82)
+    st.session_state["duplicate_suggestions"] = fuzzy_pairs(
+        scoped_works[:1200], threshold, limit=100
+    )
 
 
 def short_label(work: dict) -> str:
@@ -92,9 +128,47 @@ def short_label(work: dict) -> str:
     return f"#{work['id']} · {work['year'] or '?'} · {work['title'][:100]}"
 
 
+def remember_table_selection(
+    table_key: str,
+    record_ids: tuple[int, ...],
+    destination_key: str,
+) -> None:
+    """Remember a selected database ID when a dataframe selection changes.
+
+    A clicked cell supplies its original dataframe row position, even if the
+    user sorted the table visually. We map that position to a persistent ID
+    and keep it in session state. The callback runs before the next rendering
+    pass, so the correct editor opens immediately.
+    """
+    identifier = selected_row_identifier(st.session_state.get(table_key), record_ids)
+    if identifier is not None:
+        st.session_state[destination_key] = identifier
+
+
 def category_works(works: list[dict], category: str) -> list[dict]:
     """Filter canonical works using the same categories across all views."""
     return [work for work in works if CATEGORIES[category](work)]
+
+
+def highlight_selected_row(
+    table: pd.DataFrame,
+    record_id: int | None,
+    id_column: str,
+) -> "Styler":
+    """Emphasize the complete row whose persistent database ID is selected.
+
+    Streamlit's single-cell selection makes every cell clickable without a
+    checkbox column. Applying a Pandas Styler gives the *whole row* a visible
+    background, not just the clicked cell. The identifier (rather than a row
+    position) remains stable when the table is sorted or filtered.
+    """
+    highlight = "background-color: #f7dce2; color: #461b26; font-weight: 600"
+
+    def style_row(row: pd.Series) -> list[str]:
+        selected = record_id is not None and row[id_column] == record_id
+        return [highlight if selected else "" for _ in row]
+
+    return table.style.apply(style_row, axis=1)
 
 
 def members_table(members: list[dict]) -> pd.DataFrame:
@@ -111,7 +185,7 @@ def members_table(members: list[dict]) -> pd.DataFrame:
             "OpenAlex IDs": ", ".join(person["openalex_ids"]),
             "Start year": person["publication_year_from"],
             "End year": person["publication_year_to"],
-            "Active": bool(person["active"]),
+            "Active": "Yes" if person["active"] else "No",
         }
         for person in members
     ]
@@ -185,7 +259,25 @@ def render_team_tab(connection, members: list[dict], labels: dict[int, str]) -> 
         "no limit. The active/inactive flag does not remove former members "
         "from historical reporting."
     )
-    st.dataframe(members_table(members), hide_index=True, use_container_width=True)
+    st.caption("Click anywhere on a row to highlight it and edit that team member below.")
+    member_ids = tuple(person["id"] for person in members)
+    st.dataframe(
+        highlight_selected_row(
+            members_table(members),
+            st.session_state.get("selected_member_id"),
+            "Internal ID",
+        ),
+        hide_index=True,
+        use_container_width=True,
+        key="team_member_table",
+        on_select=partial(
+            remember_table_selection,
+            "team_member_table",
+            member_ids,
+            "selected_member_id",
+        ),
+        selection_mode="single-cell",
+    )
 
     left, right = st.columns(2, gap="large")
 
@@ -231,14 +323,13 @@ def render_team_tab(connection, members: list[dict], labels: dict[int, str]) -> 
             st.info("Add a researcher to begin.")
             return
 
-        edit_id = st.selectbox(
-            "Researcher",
-            [person["id"] for person in members],
-            format_func=lambda identifier: labels[identifier],
-            key="edit_member_id",
-        )
-        person = next(person for person in members if person["id"] == edit_id)
+        edit_id = st.session_state.get("selected_member_id")
+        person = next((item for item in members if item["id"] == edit_id), None)
+        if person is None:
+            st.info("Select a team member in the table above to edit their details.")
+            return
 
+        st.caption(f"Editing: {person['name']}")
         with st.form(f"edit_member_{edit_id}"):
             first_name = st.text_input("First name", value=person["first_name"])
             last_name = st.text_input("Last name", value=person["last_name"])
@@ -300,6 +391,7 @@ def render_team_tab(connection, members: list[dict], labels: dict[int, str]) -> 
             )
             if st.button("Remove member", disabled=not confirmed, key="delete_member"):
                 delete_member(connection, edit_id)
+                st.session_state.pop("selected_member_id", None)
                 report_and_reload("Researcher removed; publications retained.")
 
 
@@ -599,13 +691,22 @@ def render_library_tab(
         ).casefold()
     ]
 
+    st.caption("Click any cell to highlight its entire publication row and open the editor below.")
     tab_names = [
         f"{category} ({len(category_works(filtered, category))})"
         for category in CATEGORIES
     ]
-    for tab, category in zip(st.tabs(tab_names), CATEGORIES):
+    # Persist the active category when a row click triggers a Streamlit rerun.
+    category_tabs = st.tabs(
+        tab_names, key="paperazzi_library_category", on_change="rerun"
+    )
+    for tab, category in zip(category_tabs, CATEGORIES):
+        if not tab.open:
+            continue
         with tab:
             subset = category_works(filtered, category)
+            record_ids = tuple(work["id"] for work in subset)
+            table_key = f"library_table_{category.lower().replace(' ', '_')}"
             table = pd.DataFrame([
                 {
                     "ID": work["id"],
@@ -616,11 +717,26 @@ def render_library_tab(
                     "Citations*": work["citations"],
                     "DOI": work["doi"],
                     "Sources": work["sources"],
-                    "Excluded": bool(work["excluded"]),
+                    "Excluded": "Yes" if work["excluded"] else "No",
                 }
                 for work in subset
             ])
-            st.dataframe(table, use_container_width=True, hide_index=True, height=330)
+            st.dataframe(
+                highlight_selected_row(
+                    table, st.session_state.get("selected_work_id"), "ID"
+                ),
+                use_container_width=True,
+                hide_index=True,
+                height=330,
+                key=table_key,
+                on_select=partial(
+                    remember_table_selection,
+                    table_key,
+                    record_ids,
+                    "selected_work_id",
+                ),
+                selection_mode="single-cell",
+            )
             if subset:
                 st.download_button(
                     f"↓ Export {category} CSV",
@@ -636,15 +752,17 @@ def render_library_tab(
         st.info("No publications match the current filters. Adjust your scope or import data.")
         return
 
-    labels_by_id = {work["id"]: short_label(work) for work in filtered}
-    publication_id = st.selectbox(
-        "Publication to review",
-        list(labels_by_id),
-        format_func=lambda identifier: labels_by_id[identifier],
-        key="detail_id",
-    )
-    work = next(work for work in filtered if work["id"] == publication_id)
-    original = next(work for work in works if work["id"] == publication_id)
+    publication_id = st.session_state.get("selected_work_id")
+    work = next((item for item in filtered if item["id"] == publication_id), None)
+    if work is None:
+        st.info(
+            "Select a publication in one of the tables above to edit it. "
+            "If a previously selected publication is hidden, adjust the filters."
+        )
+        return
+
+    original = next(item for item in works if item["id"] == publication_id)
+    st.caption(f"Editing publication #{publication_id}")
 
     st.markdown(f"**{work['title']}**")
     st.caption(
@@ -733,7 +851,9 @@ def render_library_tab(
     )
 
 
-def render_reconcile_tab(connection, works: list[dict]) -> None:
+def render_reconcile_tab(
+    connection, works: list[dict], members: list[dict], options: dict
+) -> None:
     """Suggest fuzzy matches while requiring manual confirmation of merges."""
     st.subheader("Reconcile source records")
     st.write(
@@ -741,12 +861,15 @@ def render_reconcile_tab(connection, works: list[dict]) -> None:
         "Similar titles are suggestions only and require human review."
     )
 
-    threshold = st.slider("Title similarity threshold", 0.65, 0.98, 0.82, step=0.01)
+    threshold = st.slider(
+        "Title similarity threshold", 0.65, 0.98, 0.82,
+        step=0.01, key="reconcile_threshold",
+    )
     candidates = works[:1200]
     if len(works) > 1200:
         st.info(
             "Suggestions examine the 1,200 most recent publications for "
-            "responsiveness. Manual merging is available for the full library."
+            "responsiveness. Manual merging is available for the full reporting scope."
         )
     if st.button("Find potential duplicates"):
         with st.spinner("Comparing publication titles…"):
@@ -784,7 +907,11 @@ def render_reconcile_tab(connection, works: list[dict]) -> None:
         if st.button("Merge candidate pair", type="primary"):
             other = second["id"] if destination == first["id"] else first["id"]
             merge_team_works(connection, destination, [other])
-            report_and_reload("Two publications merged; member assignments retained.")
+            refresh_duplicate_suggestions(connection, members, options)
+            report_and_reload(
+                "Two publications merged; member assignments retained.",
+                clear_duplicate_suggestions=False,
+            )
 
     st.divider()
     left, right = st.columns(2, gap="large")
@@ -807,7 +934,10 @@ def render_reconcile_tab(connection, works: list[dict]) -> None:
                     connection, destination,
                     [identifier for identifier in selected if identifier != destination],
                 )
-                report_and_reload("Merge completed.")
+                refresh_duplicate_suggestions(connection, members, options)
+                report_and_reload(
+                    "Merge completed.", clear_duplicate_suggestions=False,
+                )
 
     with right:
         st.markdown("#### Split a source record")
@@ -834,7 +964,11 @@ def render_reconcile_tab(connection, works: list[dict]) -> None:
         )
         if st.button("Split into a separate publication"):
             split_variant(connection, variant_id)
-            report_and_reload("Source record split. Review its team-member assignments.")
+            refresh_duplicate_suggestions(connection, members, options)
+            report_and_reload(
+                "Source record split. Review its team-member assignments.",
+                clear_duplicate_suggestions=False,
+            )
 
 
 def render_statistics_tab(
@@ -842,6 +976,7 @@ def render_statistics_tab(
     selected_works: list[dict],
     selected_members: list[int],
     labels: dict,
+    year_from: int,
 ) -> None:
     """Summarize the currently scoped, deduplicated team bibliography."""
     st.subheader("Team statistics")
@@ -859,49 +994,70 @@ def render_statistics_tab(
     second.metric("h-index*", h_index(frame["citations"]))
     third.metric("i10-index*", int((frame["citations"] >= 10).sum()))
 
-    year_frame = frame.dropna(subset=["year"]).copy()
-    left, right = st.columns(2)
-    if not year_frame.empty:
-        by_year = year_frame.groupby("year").size().reset_index(name="Publications")
-        left.plotly_chart(
-            px.bar(
-                by_year, x="year", y="Publications",
-                title="Unique publications by year", labels={"year": "Year"},
-            ),
-            use_container_width=True,
-        )
-        citations_by_year = year_frame.groupby("year")["citations"].sum().reset_index()
-        right.plotly_chart(
-            px.bar(
-                citations_by_year, x="year", y="citations",
-                title="Current citations by publication year",
-                labels={"year": "Year", "citations": "Citations"},
-            ),
-            use_container_width=True,
-        )
-
+    # First row: the breakdown by BibTeX entry type and publication year.
     left, right = st.columns(2)
     by_type = frame.groupby("bibtex_type").size().reset_index(name="Publications")
     left.plotly_chart(
-        px.bar(by_type, x="bibtex_type", y="Publications", title="BibTeX entry types"),
+        px.bar(
+            by_type,
+            x="bibtex_type",
+            y="Publications",
+            title="BibTeX entry types",
+            labels={"bibtex_type": "BibTeX type"},
+        ),
         use_container_width=True,
     )
-    contributions = [
-        {
-            "Researcher": labels[member_id],
-            "Publications": sum(member_id in work["member_ids"] for work in selected_works),
-        }
-        for member_id in selected_members if member_id in labels
-    ]
-    if contributions:
-        contributions.sort(key=lambda entry: entry["Publications"], reverse=True)
+
+    year_frame = frame.dropna(subset=["year"])
+    if not year_frame.empty:
+        by_year = year_frame.groupby("year").size().reset_index(name="Publications")
         right.plotly_chart(
             px.bar(
-                pd.DataFrame(contributions), x="Researcher", y="Publications",
+                by_year,
+                x="year",
+                y="Publications",
+                title="Unique publications by year",
+                labels={"year": "Year"},
+            ),
+            use_container_width=True,
+        )
+    else:
+        right.info("Publication years are unavailable for the selected works.")
+
+    # Second row: each eligible coauthor receives full credit for a shared
+    # paper and its citations. These per-member sums are not team totals.
+    member_impact = summarize_member_impact(selected_works, selected_members, labels)
+    left, right = st.columns(2)
+    if member_impact:
+        contributions = pd.DataFrame(member_impact)
+        by_publications = contributions.sort_values(
+            ["Publications", "Researcher"], ascending=[False, True]
+        )
+        left.plotly_chart(
+            px.bar(
+                by_publications,
+                x="Researcher",
+                y="Publications",
                 title="Publications by team member",
             ),
             use_container_width=True,
         )
+
+        by_citations = contributions.sort_values(
+            ["Citations", "Researcher"], ascending=[False, True]
+        )
+        right.plotly_chart(
+            px.bar(
+                by_citations,
+                x="Researcher",
+                y="Citations",
+                title="Citations by team member",
+            ),
+            use_container_width=True,
+        )
+    else:
+        left.info("No team members are selected.")
+        right.info("No team members are selected.")
 
     # A separate category summary includes book chapters independently of 'Other'.
     st.markdown("#### Publication categories")
@@ -925,21 +1081,41 @@ def render_statistics_tab(
         except (TypeError, ValueError):
             continue
         for record in raw.get("counts_by_year") or []:
-            if record.get("year") is not None and record.get("cited_by_count") is not None:
-                annual_citations[int(record["year"])] += int(record["cited_by_count"])
+            year = record.get("year")
+            count = record.get("cited_by_count")
+
+            if year is None or count is None:
+                continue
+
+            year = int(year)
+
+            # Restrict citation events to the global reporting period.
+            if year_from is not None and year < year_from:
+                continue
+
+            annual_citations[year] += int(count)
 
     if annual_citations:
         citation_frame = pd.DataFrame([
             {"Year": year, "Citations": citations}
             for year, citations in sorted(annual_citations.items())
         ])
-        st.plotly_chart(
-            px.line(
-                citation_frame, x="Year", y="Citations", markers=True,
-                title="Citations received per year (OpenAlex)",
-            ),
-            use_container_width=True,
+        fig = px.line(
+            citation_frame,
+            x="Year",
+            y="Citations",
+            markers=True,
+            title="Citations received per year (OpenAlex)",
         )
+
+        fig.update_xaxes(
+            tickmode="linear",
+            tick0=int(citation_frame["Year"].min()),
+            dtick=1,
+            tickformat="d",
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Most-cited publications")
     st.dataframe(
@@ -1062,25 +1238,40 @@ def main() -> None:
                 "members, or include unassigned publications in the sidebar."
             )
 
-        pages = st.tabs([
-            "👥 Team", "⬇️ Import", "📚 Library", "🔀 Reconcile",
-            "📊 Statistics", "📦 Export",
-        ])
+        # Keyed tabs remember the active section across full-script reruns.
+        # This also prevents a completed merge from sending the user back to Team.
+        pages = st.tabs(
+            [
+                "👥 Team", "⬇️ Import", "📚 Library", "🔀 Reconcile",
+                "📊 Statistics", "📦 Export",
+            ],
+            key="paperazzi_main_tab",
+            on_change="rerun",
+        )
 
-        with pages[0]:
-            render_team_tab(connection, members, labels)
-        with pages[1]:
-            render_import_tab(connection, members, labels, options)
-        with pages[2]:
-            render_library_tab(connection, all_works, members, labels, options)
-        with pages[3]:
-            render_reconcile_tab(connection, all_works)
-        with pages[4]:
-            render_statistics_tab(
-                connection, selected_works, options["selected_members"], labels
-            )
-        with pages[5]:
-            render_export_tab(connection, selected_works, members)
+        # Render only the active section. Hidden tabs do not need to query the
+        # database or construct interactive widgets during another workflow.
+        if pages[0].open:
+            with pages[0]:
+                render_team_tab(connection, members, labels)
+        if pages[1].open:
+            with pages[1]:
+                render_import_tab(connection, members, labels, options)
+        if pages[2].open:
+            with pages[2]:
+                render_library_tab(connection, all_works, members, labels, options)
+        if pages[3].open:
+            with pages[3]:
+                render_reconcile_tab(connection, selected_works, members, options)
+        if pages[4].open:
+            with pages[4]:
+                render_statistics_tab(
+                    connection, selected_works, options["selected_members"], labels,
+                    options["year_from"]
+                )
+        if pages[5].open:
+            with pages[5]:
+                render_export_tab(connection, selected_works, members)
 
         st.divider()
         st.caption("Paperazzi · local app · SQLite storage · MIT license")
