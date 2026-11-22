@@ -17,12 +17,23 @@ It runs locally in your browser, with your data stored in SQLite on your compute
 
 Requires **Python 3.10+**, an [OpenAlex API key](https://openalex.org/settings/api), and Python virtual-environment support.
 
-On Ubuntu or Linux:
+On Linux:
 
 ```bash
 git clone https://github.com/gwenole-quellec/paperazzi.git
 cd paperazzi
 ./start.sh
+```
+
+Dependencies are installed automatically on first launch and updated when the requirements files change.
+
+Alternatively, on other operating systems:
+
+```bash
+git clone https://github.com/gwenole-quellec/paperazzi.git
+cd paperazzi
+python -m pip install -r requirements.txt
+python -m streamlit run paperazzi.py
 ```
 
 Open **http://localhost:8501**. Dependencies are installed automatically on first launch.
